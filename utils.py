@@ -93,6 +93,7 @@ def nploadp(filepath,
     """
     Load Numpy array with progress messages. Log progress using logging if log=True.
     """
+    mmap = None
     try:
         mmap = np.load(filepath, mmap_mode='r')
         y = np.empty_like(mmap)
@@ -105,7 +106,8 @@ def nploadp(filepath,
                 print(f"[{nowdatestr}] Loading Numpy array into memory, block {b+1}/{n_blocks}")
             y[b*blocksize : (b+1) * blocksize] = mmap[b*blocksize : (b+1) * blocksize]
     finally:
-        del mmap  # make sure file is closed again
+        if mmap is not None:
+            del mmap  # make sure file is closed again
     return y
 
 

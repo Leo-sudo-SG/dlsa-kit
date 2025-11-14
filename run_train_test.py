@@ -10,6 +10,9 @@ import re
 import shutil
 import socket
 import time
+import io
+import zipfile
+import urllib.request
 
 import yaml
 import petname
@@ -96,40 +99,82 @@ def run(config:dict,
             datanames += ['IPCA'+str(factor)]
             residual_weightsNames += [f"residuals/{ipcadir}/{ipcamtag}_{factor}_factors_{im}_initialMonths_{w}_window_12_reestimationFreq_{cap}_cap.npy"]
         #PCA
-        pcadir = "pca"
-        pcartag = "AvPCA_OOSresiduals"
-        pcamtag = "AvPCA_OOSMatrixresiduals"
-        for factor in factor_models["PCA"]:
-            ioy = 1998
-            w = 60
-            cw = 252
-            filepaths += [f"residuals/{pcadir}/{pcartag}_{factor}_factors_{ioy}_initialOOSYear_{w}_rollingWindow_{cw}_covWindow_{cap}_Cap.npy"]
-            datanames += ['PCA'+str(factor)]
-            residual_weightsNames += [f"residuals/{pcadir}/{pcamtag}_{factor}_factors_{ioy}_initialOOSYear_{w}_rollingWindow_{cw}_covWindow_{cap}_Cap.npy"]
+        if "PCA" in factor_models:
+            pcadir = "pca"
+            pcartag = "AvPCA_OOSresiduals"
+            pcamtag = "AvPCA_OOSMatrixresiduals"
+            for factor in factor_models["PCA"]:
+                ioy = 1998
+                w = 60
+                cw = 252
+                filepaths += [f"residuals/{pcadir}/{pcartag}_{factor}_factors_{ioy}_initialOOSYear_{w}_rollingWindow_{cw}_covWindow_{cap}_Cap.npy"]
+                datanames += ['PCA'+str(factor)]
+                residual_weightsNames += [f"residuals/{pcadir}/{pcamtag}_{factor}_factors_{ioy}_initialOOSYear_{w}_rollingWindow_{cw}_covWindow_{cap}_Cap.npy"]
         #FamaFrench
-        ffdir = "famafrench"
-        ffrtag = "DailyFamaFrench_OOSresiduals"
-        ffmtag = "DailyFamaFrench_OOSMatrixresiduals"
-        for factor in factor_models["FamaFrench"]:
-            ioy = 1998
-            w = 60 
-            filepaths += [f"residuals/{ffdir}/{ffrtag}_{factor}_factors_{ioy}_initialOOSYear_{w}_rollingWindow_{cap}_Cap.npy" ]
-            #filepaths += [f"residuals/ff-universe-residuals/ff-universe-residuals_{factor}_factors_1998_initialOOSYear_60_rollingWindow_0.01_Cap.npy" ]
-            datanames += ['FamaFrench'+str(factor)]
-            #datanames += ['FamaFrenchNew'+str(factor)]
-            residual_weightsNames += [f"residuals/{ffdir}/{ffmtag}_{factor}_factors_{ioy}_initialOOSYear_{w}_rollingWindow_{cap}_Cap.npy" ]
-            #residual_weightsNames += [f"residuals/ff-universe-residuals/ff-universe-transition-matrices_{factor}_factors_1998_initialOOSYear_60_rollingWindow_0.01_Cap.npy" ]
+        if "FamaFrench" in factor_models:
+            ffdir = "famafrench"
+            ffrtag = "DailyFamaFrench_OOSresiduals"
+            ffmtag = "DailyFamaFrench_OOSMatrixresiduals"
+            for factor in factor_models["FamaFrench"]:
+                ioy = 1998
+                w = 60 
+                filepaths += [f"residuals/{ffdir}/{ffrtag}_{factor}_factors_{ioy}_initialOOSYear_{w}_rollingWindow_{cap}_Cap.npy" ]
+                #filepaths += [f"residuals/ff-universe-residuals/ff-universe-residuals_{factor}_factors_1998_initialOOSYear_60_rollingWindow_0.01_Cap.npy" ]
+                datanames += ['FamaFrench'+str(factor)]
+                #datanames += ['FamaFrenchNew'+str(factor)]
+                residual_weightsNames += [f"residuals/{ffdir}/{ffmtag}_{factor}_factors_{ioy}_initialOOSYear_{w}_rollingWindow_{cap}_Cap.npy" ]
+                #residual_weightsNames += [f"residuals/ff-universe-residuals/ff-universe-transition-matrices_{factor}_factors_1998_initialOOSYear_60_rollingWindow_0.01_Cap.npy" ]
 
-        # load dates
-        dates_filepath = 'data/F-F_Research_Data_5_Factors_2x3_daily.CSV'
-        if not os.path.exists(dates_filepath):
-            ff5 = pd.read_csv("https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_5_Factors_2x3_daily_CSV.zip", header=2, index_col=0)
-            ff5.to_csv(dates_filepath)
-        FamaFrenchDailyData = pd.read_csv(dates_filepath, index_col=0) / 100
-        daily_dates = pd.to_datetime(
-            FamaFrenchDailyData.index[(FamaFrenchDailyData.index > 19980000) & (FamaFrenchDailyData.index < 20170000)],
-            format ='%Y%m%d')
-        del FamaFrenchDailyData
+        # load dates (only if FamaFrench is used)
+        if "FamaFrench" in factor_models:
+            dates_filepath = 'data/F-F_Research_Data_5_Factors_2x3_daily.CSV'
+            if not os.path.exists(dates_filepath):
+                # Download the zipped CSV and read the contained CSV robustly
+                url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_5_Factors_2x3_daily_CSV.zip"
+                try:
+                    with urllib.request.urlopen(url) as resp:
+                        raw = resp.read()
+                    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                        # find first CSV file inside the zip
+                        csv_names = [n for n in zf.namelist() if n.lower().endswith('.csv')]
+                        if len(csv_names) == 0:
+                            raise Exception('No CSV file found inside FamaFrench zip')
+                        with zf.open(csv_names[0]) as fh:
+                            raw_bytes = fh.read()
+                            try:
+                                text = raw_bytes.decode('utf-8')
+                            except Exception:
+                                text = raw_bytes.decode('latin1')
+                            lines = text.splitlines()
+                            data_row = None
+                            for i, line in enumerate(lines):
+                                parts = [p.strip() for p in re.split(r',\s*', line)]
+                                if len(parts) >= 2 and re.match(r'^\d{6,8}$', parts[0]):
+                                    data_row = i
+                                    break
+                            if data_row is None:
+                                # fallback to previous assumption
+                                header_row = 2
+                            else:
+                                header_row = max(0, data_row - 1)
+                            ff5 = pd.read_csv(io.StringIO(text), header=header_row, index_col=0)
+                    ff5.to_csv(dates_filepath)
+                except Exception:
+                    # Fallback: try pandas direct read (older environments)
+                    ff5 = pd.read_csv(url, header=2, index_col=0)
+                    ff5.to_csv(dates_filepath)
+            # Read the Fama-French CSV and parse the index to datetimes robustly
+            FamaFrenchDailyData = pd.read_csv(dates_filepath, index_col=0)
+            # Parse index entries (which may be strings) into datetimes of form YYYYMMDD
+            idx_dt = pd.to_datetime(FamaFrenchDailyData.index.astype(str), format='%Y%m%d', errors='coerce')
+            # Select range 1998-01-01 through 2016-12-31 (inclusive)
+            mask = (idx_dt >= pd.Timestamp('1998-01-01')) & (idx_dt <= pd.Timestamp('2016-12-31'))
+            daily_dates = idx_dt[mask]
+            # Normalize factor returns to decimal (was dividing by 100 previously)
+            FamaFrenchDailyData = FamaFrenchDailyData.astype(float) / 100
+            del FamaFrenchDailyData
+        else:
+            daily_dates = None
     
         # Test loop
         for i in range(len(filepaths)):
@@ -137,11 +182,29 @@ def run(config:dict,
             logging.info(f'Testing {filepaths[i]}')
             filepath = filepaths[i]
             logging.info('Loading residuals')
-            if not os.path.exists(filepath) and os.path.exists(filepath + ".gz"):
+            if not os.path.isfile(filepath) and os.path.exists(filepath + ".gz"):
                 logging.info("Unzipping residual file")
-                with gzip.open(filepath + ".gz", 'rb') as f_in:
-                    with open(filepath, 'wb') as f_out:
-                        shutil.copyfileobj(f_in, f_out)
+                # Remove any trailing .npy directory that shouldn't be there
+                if os.path.isdir(filepath):
+                    # filepath is a directory, so use the nested file inside it
+                    nested_filepath = os.path.join(filepath, os.path.basename(filepath))
+                    if os.path.isfile(nested_filepath):
+                        filepath = nested_filepath
+                    else:
+                        # Directory exists but nested file doesn't, unzip the .gz
+                        with gzip.open(filepath + ".gz", 'rb') as f_in:
+                            with open(filepath, 'wb') as f_out:
+                                shutil.copyfileobj(f_in, f_out)
+                else:
+                    # filepath doesn't exist, unzip the .gz
+                    with gzip.open(filepath + ".gz", 'rb') as f_in:
+                        with open(filepath, 'wb') as f_out:
+                            shutil.copyfileobj(f_in, f_out)
+            elif os.path.isdir(filepath):
+                # If filepath is a directory, use the nested file
+                nested_filepath = os.path.join(filepath, os.path.basename(filepath))
+                if os.path.isfile(nested_filepath):
+                    filepath = nested_filepath
             residuals = np.load(filepath).astype(np.float32)
             if 'perturbation' in config and len(config['perturbation']) > 0:
                 logging.info(f"Before perturbing residuals: std: {np.std(residuals[residuals != 0]):0.4f}")
@@ -153,9 +216,38 @@ def run(config:dict,
             if use_residual_weights:
                 logging.info('Loading residual composition matrix')
                 residual_weight_marker = "__residual_weights"
-                # residual_weights = np.load(residual_weightsNames[i]) #.astype(np.float32)
-                residual_weights = nploadp(residual_weightsNames[i])
-                logging.info('Residual composition matrix loaded')
+                # resolve residual-weights filepath: handle nested directory or .gz like residuals
+                rw_path = residual_weightsNames[i]
+                # if rw_path is a directory, prefer a nested file with the same basename
+                if os.path.isdir(rw_path):
+                    nested_rw = os.path.join(rw_path, os.path.basename(rw_path))
+                    if os.path.isfile(nested_rw):
+                        rw_path = nested_rw
+                    else:
+                        # if a .gz exists for the path, unzip into the nested file inside the directory
+                        if os.path.exists(rw_path + ".gz"):
+                            logging.info("Unzipping residual-weights file into nested file")
+                            nested_rw = os.path.join(rw_path, os.path.basename(rw_path))
+                            with gzip.open(rw_path + ".gz", 'rb') as f_in:
+                                with open(nested_rw, 'wb') as f_out:
+                                    shutil.copyfileobj(f_in, f_out)
+                            rw_path = nested_rw
+
+                # if rw_path doesn't exist but a .gz exists (and rw_path is not a directory), unzip it
+                if (not os.path.isfile(rw_path)) and os.path.exists(rw_path + ".gz") and (not os.path.isdir(rw_path)):
+                    logging.info("Unzipping residual-weights file")
+                    with gzip.open(rw_path + ".gz", 'rb') as f_in:
+                        with open(rw_path, 'wb') as f_out:
+                            shutil.copyfileobj(f_in, f_out)
+
+                # if final rw_path exists and is a file, load it; otherwise warn and skip residual weights
+                if os.path.isfile(rw_path):
+                    residual_weights = nploadp(rw_path)
+                    logging.info('Residual composition matrix loaded')
+                else:
+                    logging.warning(f'Residual weights file not found: {residual_weightsNames[i]}; continuing without residual weights')
+                    residual_weights = None
+                    residual_weight_marker = ""
             else:
                 residual_weight_marker = ""
                 residual_weights = None
@@ -220,7 +312,7 @@ def run(config:dict,
                                                                      parallelize = True, 
                                                                      log_dev_progress_freq = 10, 
                                                                      log_plot_freq = 149, 
-                                                                     device = f'cuda:{device_ids[0]}', 
+                                                                     device = f'cuda:{device_ids[0]}' if device_ids else 'cpu', 
                                                                      device_ids = device_ids,
                                                                      output_path = outdir, 
                                                                      num_epochs = config['num_epochs'], 
@@ -247,11 +339,11 @@ def run(config:dict,
                                                                          parallelize = True, 
                                                                          log_dev_progress_freq = 10, 
                                                                          log_plot_freq = 149, 
-                                                                         device = f'cuda:{device_ids[0]}', 
+                                                                         device = f'cuda:{device_ids[0]}' if device_ids else 'cpu', 
                                                                          device_ids = device_ids,
                                                                          output_path = outdir, 
                                                                          num_epochs = config['num_epochs'], 
-                                                                         lr = config['learning_rate'], 
+                                                                         lr = config['optimizer_opts'].get('lr', 0.001), 
                                                                          early_stopping = config['early_stopping'],
                                                                          model_tag = model_tag, 
                                                                          batchsize = config['batch_size'], 

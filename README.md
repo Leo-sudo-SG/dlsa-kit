@@ -16,6 +16,39 @@ where `config_name_here.yaml` is a configuration file from the `configs` folder.
 You can write your own configuration file to edit hyperparameters and other 
 settings for the trading test. See `run_train_test.py` for other command line options.
 
+## Toy Examples (Learning & Testing)
+
+For learning and testing purposes, this repo includes toy scripts that demonstrate the complete pipeline on synthetic data:
+
+### 1. Toy IPCA Example
+Generate synthetic residuals using the IPCA algorithm:
+```bash
+python toy_ipca_example.py
+```
+**Output**: Synthetic residuals (CSV format) in `toy_ipca_output/`
+**Documentation**: See `TOY_IPCA_README.md`
+
+### 2. Toy Downstream Pipeline
+Train a trading model on the toy residuals:
+```bash
+python toy_downstream_pipeline.py
+```
+**Output**: Backtest results, training curves, performance metrics in `toy_downstream_output/`
+**Documentation**: See `TOY_DOWNSTREAM_README.md`
+
+**Data Flow**:
+```
+toy_ipca_example.py → residuals (CSV) → toy_downstream_pipeline.py → backtest results
+```
+
+**Features**:
+- ✅ Three preprocessing options: cumsum, Fourier, OU
+- ✅ Two model architectures: CNNTransformer, RawFFN  
+- ✅ Complete training and evaluation loop
+- ✅ Comprehensive backtest statistics and visualizations
+
+See `DOCUMENTATION_INDEX.md` for comprehensive guides on both toy examples.
+
 ## Structure
 
 This repo is organized as follows:
