@@ -1,0 +1,110 @@
+# GNN-Enhanced Transformer Configuration for Statistical Arbitrage
+# This configuration extends CNN+Transformer with Graph Neural Networks
+# to capture spatial dependencies between assets
+
+# Major parameters
+mode: "test"  # can be 'test' or 'estimate'
+results_tag: "gnn"  # optional tag for results
+debug: False  # set to True to turn on debug logging
+
+# Model parameters
+model_name: "GNNTransformer"  # GNN-enhanced model
+model: {
+  lookback: 30,  # number of days of preprocessed residual time series
+  
+  # GNN-specific parameters
+  gnn_type: "GAT",  # Graph Neural Network type: 'GAT' (Graph Attention) or 'GCN' (Graph Convolution)
+  gnn_hidden_dim: 16,  # Hidden dimension for GNN layers
+  gnn_num_layers: 2,  # Number of GNN layers for spatial aggregation
+  gnn_heads: 4,  # Number of attention heads (for GAT)
+  gnn_dropout: 0.25,  # Dropout rate for GNN layers
+  
+  # CNN parameters (adjusted for GNN output)
+  filter_numbers: [16, 32],  # CNN filter dimensions (first must match or be projected from gnn_hidden_dim)
+  filter_size: 2,  # CNN kernel size
+  normalization_conv: True,  # normalize convolutions
+  
+  # Transformer parameters
+  use_transformer: True,
+  attention_heads: 4,  # Number of transformer attention heads
+  hidden_units_factor: 2,  # Multiplier for hidden units (2 * filter_numbers[-1] = 64)
+  dropout: 0.25,  # General dropout rate
+}
+
+# =============================================================================
+# GRAPH CONSTRUCTION PARAMETERS (PRIMARY: Residual-based)
+# =============================================================================
+# Graph is constructed from residual correlations (no gamma files needed)
+graph_params: {
+  # Method for computing similarity between assets
+  # Options: 'correlation' (recommended), 'abs_correlation', 'graphical_lasso'
+  method: "correlation",
+  
+  # Graph construction type
+  # Options: 'knn' (k-nearest neighbors), 'threshold' (similarity cutoff)
+  graph_type: "knn",
+  
+  # Parameters for k-NN graph
+  k_neighbors: 10,  # Number of neighbors per asset
+  
+  # Parameters for threshold graph (alternative to k-NN)
+  threshold: 0.3,  # Minimum correlation for edge creation
+  
+  # Lookback window for computing correlations
+  lookback: 250,  # Use last 250 trading days (~1 year)
+  
+  # Minimum observations required for valid correlation
+  min_obs: 30,
+  
+  # Include self-loops in graph
+  include_self: True,
+}
+
+# Data parameters
+preprocess_func: "preprocess_cumsum"  # preprocessing: 'preprocess_cumsum', 'preprocess_fourier', 'preprocess_ou'
+use_residual_weights: True  # use residual composition matrix for turnover calculation
+cap_proportion: 0.01  # market cap threshold (0.01 = top 1% of market cap)
+
+factor_models: {  # number of factors per residual time series to test
+    "IPCA": [5],  # Start with 5 factors as baseline
+    # "IPCA": [3, 5, 8, 10],  # Uncomment for full factor sweep
+    # "PCA": [5],
+    # "FamaFrench": [5],
+}
+
+perturbation: {  # optional noise perturbation (leave empty to disable)
+    # "noise_type" : "gaussian",
+    # "noise_mean" : 0.0,
+    # "noise_std_pct" : 2,
+    # "noise_only" : False,
+    # "per_residual" : True,
+}
+
+# Training parameters
+num_epochs: 100  # number of training epochs per window
+optimizer_name: "Adam"  # PyTorch optimizer
+optimizer_opts: {
+  lr: 0.001  # learning rate
+}
+batch_size: 125  # batch size for training
+retrain_freq: 125  # retraining frequency in days (if mode=='estimate', this is test set size)
+rolling_retrain: True  # rolling window retraining (False = train once, test on all future data)
+force_retrain: True  # force retraining even if saved weights exist
+length_training: 1000  # training window size in trading days
+early_stopping: False  # enable early stopping
+objective: "sharpe"  # objective function: 'sharpe', 'meanvar', or 'sqrtMeanSharpe'
+
+# Market frictions parameters
+market_frictions: False  # enable transaction costs
+trans_cost: 0  # transaction cost in bps per side per equity (e.g., 0.0005 = 5 bps)
+hold_cost: 0  # holding cost for short positions in bps per day (e.g., 0.0001 = 1 bp)
+
+# GNN-specific data parameters
+ipca_params: {
+  initial_months: 420,  # initial training months for IPCA
+  window: 240,  # IPCA rolling window size in months
+  reestimation_freq: 12,  # IPCA reestimation frequency in months
+}
+
+graph_cache: True  # cache constructed graphs to disk for faster loading
+
