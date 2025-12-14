@@ -209,10 +209,14 @@ def run(config: dict,
         
         # Load dates
         daily_dates_file = f"residuals/{ipcadir}/{ipcartag}_1_factors_{im}_initialMonths_{w}_window_12_reestimationFreq_{cap}_cap.npy"
-        if os.path.exists(daily_dates_file + '.gz'):
-            Data1 = nploadp(daily_dates_file + '.gz')
-        else:
-            Data1 = np.load(daily_dates_file)
+        if not os.path.isfile(daily_dates_file) and os.path.exists(daily_dates_file + ".gz"):
+            logging.info("Unzipping daily dates file")
+            # Unzip the .gz file first
+            with gzip.open(daily_dates_file + ".gz", 'rb') as f_in:
+                with open(daily_dates_file, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+        
+        Data1 = np.load(daily_dates_file, allow_pickle=True)
         
         # Create dates (simplified - in practice would load from IPCA)
         daily_dates = pd.date_range(start='1998-01-01', periods=Data1.shape[0], freq='D')
@@ -281,7 +285,7 @@ def run(config: dict,
                 logging.warning(f"File not found: {filepath}")
                 continue
             
-            Data = np.load(filepath).astype(np.float32)
+            Data = np.load(filepath, allow_pickle=True).astype(np.float32)
             logging.info(f"Residuals loaded: shape {Data.shape}")
             Data[np.isnan(Data)] = 0
             
@@ -315,7 +319,7 @@ def run(config: dict,
                             shutil.copyfileobj(f_in, f_out)
                 
                 if os.path.isfile(rw_path):
-                    residual_weights = np.load(rw_path)
+                    residual_weights = np.load(rw_path, allow_pickle=True)
                     logging.info(f"Residual weights loaded: shape {residual_weights.shape}")
                 else:
                     logging.warning(f"Residual weights not found: {residual_weights_name}")

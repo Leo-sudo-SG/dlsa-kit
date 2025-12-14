@@ -95,7 +95,7 @@ def nploadp(filepath,
     """
     mmap = None
     try:
-        mmap = np.load(filepath, mmap_mode='r')
+        mmap = np.load(filepath, mmap_mode='r', allow_pickle=True)
         y = np.empty_like(mmap)
         n_blocks = int(np.ceil(mmap.shape[0] / blocksize))
         for b in range(n_blocks):

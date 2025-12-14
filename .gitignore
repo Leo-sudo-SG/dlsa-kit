@@ -1,9 +1,11 @@
 # Project-specific files
 daily-returns.csv
-*esiduals*.npy
+*residuals*.npy
 *.npz
+*.npy
 credentials.yaml
 .vscode/
+*/unzipped
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
