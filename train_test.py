@@ -600,7 +600,7 @@ def estimate(Data,
     model_tag = model_tag + f'__estimation{estimate_start_idx}-{length_training}-{test_size}'
 
     model1 = model(logdir=output_path, **config['model'])
-    rets,turns,shorts,weights = train(model1,
+    rets, turns, shorts, weights, assets_to_trade = train(model1,
                                       preprocess = preprocess,
                                       data_train = data_train, 
                                       data_dev = data_dev, 

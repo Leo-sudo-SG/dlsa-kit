@@ -3,12 +3,18 @@ GNN-enhanced Transformer model for statistical arbitrage.
 
 This model extends the CNN+Transformer architecture with Graph Neural Network layers
 to capture spatial dependencies between assets based on factor loading similarity.
+
+NOTE: The training loop in train_test.py flattens (time_step, asset) pairs into a 
+single batch dimension using boolean indexing. This means the model receives input
+with shape (N_batch, T_lookback) where N_batch is NOT the original number of assets.
+The forward pass handles this by building a graph dynamically from the input data
+when the stored graph structure doesn't match the input size.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 
 # Import PyTorch Geometric layers
 try:
@@ -121,6 +127,7 @@ class GNNTransformer(nn.Module):
                  gnn_num_layers: int = 2,
                  gnn_heads: int = 4,
                  gnn_dropout: float = 0.25,
+                 gnn_topk: int = 10,  # Number of neighbors for dynamic graph construction
                  # Graph parameters (stored but not used in forward)
                  edge_index: Optional[torch.Tensor] = None,
                  edge_weight: Optional[torch.Tensor] = None,
@@ -147,6 +154,7 @@ class GNNTransformer(nn.Module):
             gnn_num_layers: Number of GNN layers
             gnn_heads: Number of attention heads (for GAT)
             gnn_dropout: Dropout for GNN layers
+            gnn_topk: Number of neighbors for dynamic graph construction
             edge_index: Graph edge indices (2, E)
             edge_weight: Graph edge weights (E,)
             normalization_conv: Normalize CNN layers
@@ -178,6 +186,7 @@ class GNNTransformer(nn.Module):
         self.gnn_type = gnn_type
         self.gnn_num_layers = gnn_num_layers
         self.gnn_hidden_dim = gnn_hidden_dim
+        self.gnn_topk = gnn_topk  # For dynamic graph construction
         
         # Store graph structure (will be updated during training)
         self.register_buffer('edge_index', edge_index if edge_index is not None 
@@ -268,7 +277,71 @@ class GNNTransformer(nn.Module):
         """Check if the model has a valid graph structure."""
         return self.edge_index is not None and self.edge_index.shape[1] > 0
     
-    def build_graph_from_residuals(self, residuals_np: 'np.ndarray',
+    def _get_num_graph_nodes(self) -> int:
+        """Get the number of nodes the stored graph expects."""
+        if not self.has_valid_graph():
+            return 0
+        return int(self.edge_index.max().item()) + 1
+    
+    @staticmethod
+    def build_graph_from_input(x: torch.Tensor, topk: int = 10) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build a correlation-based k-NN graph from input tensor.
+        
+        This is used when the stored graph doesn't match the input size.
+        Builds graph dynamically from the current batch data.
+        
+        Args:
+            x: Input tensor (N, T) where N is number of nodes and T is sequence length
+            topk: Number of neighbors per node
+            
+        Returns:
+            edge_index: (2, E) tensor of edges
+            edge_weight: (E,) tensor of correlation values as edge weights
+        """
+        device = x.device
+        N, T = x.shape
+        
+        if N <= 1:
+            # Not enough nodes for a graph
+            return (torch.empty((2, 0), dtype=torch.long, device=device), 
+                    torch.empty(0, dtype=torch.float, device=device))
+        
+        # Center and normalize each node's time series
+        x_centered = x - x.mean(dim=1, keepdim=True)
+        norms = x_centered.norm(dim=1, keepdim=True)
+        norms = norms.clamp(min=1e-8)  # Avoid division by zero
+        x_normalized = x_centered / norms
+        
+        # Compute pairwise correlations: (N, T) @ (T, N) -> (N, N)
+        corr = torch.matmul(x_normalized, x_normalized.t())
+        corr = corr.clamp(-1.0, 1.0)
+        
+        # For each node, find top-k neighbors by absolute correlation (excluding self)
+        k = min(topk, N - 1)
+        if k <= 0:
+            return (torch.empty((2, 0), dtype=torch.long, device=device),
+                    torch.empty(0, dtype=torch.float, device=device))
+        
+        # Set diagonal to -inf so self-loops are not selected
+        corr_for_topk = corr.clone()
+        corr_for_topk.fill_diagonal_(-float('inf'))
+        
+        # Get top-k by absolute correlation
+        _, topk_indices = torch.topk(corr_for_topk.abs(), k=k, dim=1)
+        
+        # Build edge list
+        rows = torch.arange(N, device=device).unsqueeze(1).expand(-1, k).reshape(-1)
+        cols = topk_indices.reshape(-1)
+        
+        # Get correlation values as weights
+        edge_weights = corr[rows, cols]
+        
+        edge_index = torch.stack([rows, cols], dim=0).long()
+        
+        return edge_index, edge_weights
+    
+    def build_graph_from_residuals(self, residuals_np,
                                     method: str = 'correlation',
                                     graph_type: str = 'knn',
                                     k: int = 10,
@@ -308,20 +381,40 @@ class GNNTransformer(nn.Module):
         Forward pass through GNNTransformer.
         
         Args:
-            x: Input tensor (N, T) where N is number of assets, T is time steps
+            x: Input tensor (N, T) where N is number of nodes/samples, T is time steps.
+               NOTE: Due to the training loop's boolean indexing, N is typically the 
+               number of valid (time_step, asset) pairs in the batch, NOT the original
+               number of assets. The graph is built dynamically from this input.
             
         Returns:
             weights: Portfolio weights (N,)
         """
         N, T = x.shape
         
-        # Check if we have a valid graph
-        has_graph = self.has_valid_graph()
+        # Determine which graph to use
+        # The stored graph was built for a specific number of assets, but the training
+        # loop flattens (time, asset) pairs using boolean indexing, so input N doesn't
+        # match the original asset count. We need to build a graph from the input.
+        stored_graph_nodes = self._get_num_graph_nodes()
+        use_stored_graph = self.has_valid_graph() and (stored_graph_nodes == N)
+        
+        if use_stored_graph:
+            # Stored graph matches input size - use it directly
+            edge_index = self.edge_index
+            edge_weight = self.edge_weight if len(self.edge_weight) > 0 else None
+        else:
+            # Graph doesn't match input size - build dynamically from input data
+            # This handles the case where input is flattened (time, asset) pairs
+            edge_index, edge_weight = self.build_graph_from_input(x, topk=self.gnn_topk)
+            edge_index = edge_index.to(x.device)
+            edge_weight = edge_weight.to(x.device)
+        
+        has_graph = edge_index.shape[1] > 0
         
         if has_graph:
-            # Full GNN processing: spatial aggregation across assets
+            # Full GNN processing: spatial aggregation across nodes
             # Reshape for GNN: (N, T) -> process each time step through GNN
-            # We'll apply GNN to each time step independently, treating assets as graph nodes
+            # We'll apply GNN to each time step independently
             
             # Initialize output: (N, gnn_hidden_dim, T)
             gnn_output = torch.zeros(N, self.gnn_hidden_dim, T, device=x.device)
@@ -333,10 +426,10 @@ class GNNTransformer(nn.Module):
                 
                 # Apply GNN layers
                 for gnn_layer in self.gnn_layers:
-                    if len(self.edge_weight) > 0:
-                        x_t = gnn_layer(x_t, self.edge_index, self.edge_weight)
+                    if edge_weight is not None and len(edge_weight) > 0:
+                        x_t = gnn_layer(x_t, edge_index, edge_weight)
                     else:
-                        x_t = gnn_layer(x_t, self.edge_index)
+                        x_t = gnn_layer(x_t, edge_index)
                 
                 # x_t is now (N, gnn_hidden_dim)
                 gnn_output[:, :, t] = x_t
