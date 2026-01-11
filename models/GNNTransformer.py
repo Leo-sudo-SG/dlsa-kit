@@ -4,17 +4,25 @@ GNN-enhanced Transformer model for statistical arbitrage.
 This model extends the CNN+Transformer architecture with Graph Neural Network layers
 to capture spatial dependencies between assets based on factor loading similarity.
 
-NOTE: The training loop in train_test.py flattens (time_step, asset) pairs into a 
-single batch dimension using boolean indexing. This means the model receives input
-with shape (N_batch, T_lookback) where N_batch is NOT the original number of assets.
-The forward pass handles this by building a graph dynamically from the input data
-when the stored graph structure doesn't match the input size.
+NOTE ON BATCH PROCESSING:
+The training loop in train_test.py flattens (time_step, asset) pairs into a single
+batch dimension using boolean indexing. This means the model receives input with
+shape (N_batch, T_lookback) where N_batch is NOT the original number of assets.
+
+GRAPH HANDLING (Option 3 - Pre-built graph remapping):
+Rather than building a new graph dynamically (which creates unnecessary temporal
+connections), we use the pre-built asset correlation graph and remap it to match
+the batch structure. This requires passing asset_indices that indicate which
+original asset (0 to N_assets-1) each batch row corresponds to.
+
+If asset_indices is not provided, the model falls back to dynamic graph construction
+or skips GNN processing entirely.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Union
 
 # Import PyTorch Geometric layers
 try:
@@ -283,6 +291,137 @@ class GNNTransformer(nn.Module):
             return 0
         return int(self.edge_index.max().item()) + 1
     
+    def remap_graph_for_batch(self, 
+                              asset_indices: torch.Tensor,
+                              time_indices: Optional[torch.Tensor] = None,
+                              same_timestep_only: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Remap the pre-built asset graph to match batch indices.
+        
+        The pre-built graph connects original assets (0 to N_assets-1).
+        The batch contains rows that correspond to specific original assets
+        (possibly the same asset appearing multiple times at different time steps).
+        
+        This method creates edges between batch rows based on their original
+        asset relationships in the pre-built graph.
+        
+        Args:
+            asset_indices: (N_batch,) tensor where asset_indices[i] is the original
+                           asset ID (0 to N_assets-1) for batch row i
+            time_indices: Optional (N_batch,) tensor where time_indices[i] is the
+                          time step index for batch row i. If provided and 
+                          same_timestep_only=True, only edges within the same 
+                          time step are created (pure spatial graph).
+            same_timestep_only: If True and time_indices provided, only create
+                                edges between assets at the same time step.
+                                Default: True (pure spatial connections)
+        
+        Returns:
+            batch_edge_index: (2, E_batch) edges between batch indices
+            batch_edge_weight: (E_batch,) edge weights (or None)
+        
+        Example (same_timestep_only=True):
+            Pre-built graph: Asset 0 ↔ Asset 5 (correlation 0.8)
+            Batch:
+                Row 0: Asset 0 at time 0
+                Row 5: Asset 5 at time 0
+                Row 100: Asset 0 at time 1
+                Row 105: Asset 5 at time 1
+            
+            Remapped graph creates edges (only same time):
+                Row 0 ↔ Row 5 (Asset 0 ↔ Asset 5 at time 0)
+                Row 100 ↔ Row 105 (Asset 0 ↔ Asset 5 at time 1)
+        """
+        device = asset_indices.device
+        N_batch = asset_indices.shape[0]
+        
+        if not self.has_valid_graph():
+            return (torch.empty((2, 0), dtype=torch.long, device=device),
+                    None)
+        
+        # Get unique assets in this batch and their mapping
+        unique_assets = torch.unique(asset_indices)
+        
+        # Create mapping from original asset ID to list of batch indices
+        # If time_indices provided and same_timestep_only, group by (time, asset)
+        if time_indices is not None and same_timestep_only:
+            # Group by time step, then by asset within each time step
+            # time_to_asset_rows[time][asset] = [batch_indices]
+            time_to_asset_rows: Dict[int, Dict[int, list]] = {}
+            for batch_idx in range(N_batch):
+                t_idx = time_indices[batch_idx].item()
+                a_idx = asset_indices[batch_idx].item()
+                if t_idx not in time_to_asset_rows:
+                    time_to_asset_rows[t_idx] = {}
+                if a_idx not in time_to_asset_rows[t_idx]:
+                    time_to_asset_rows[t_idx][a_idx] = []
+                time_to_asset_rows[t_idx][a_idx].append(batch_idx)
+        else:
+            # Group only by asset (cross-time connections allowed)
+            asset_to_batch_rows: Dict[int, list] = {}
+            for batch_idx in range(N_batch):
+                asset_id = asset_indices[batch_idx].item()
+                if asset_id not in asset_to_batch_rows:
+                    asset_to_batch_rows[asset_id] = []
+                asset_to_batch_rows[asset_id].append(batch_idx)
+        
+        # Filter pre-built edges to only those involving assets in this batch
+        edge_src = self.edge_index[0]  # Original asset IDs
+        edge_dst = self.edge_index[1]  # Original asset IDs
+        
+        # Create set for O(1) lookup
+        assets_in_batch = set(unique_assets.tolist())
+        
+        # Build remapped edges
+        new_src = []
+        new_dst = []
+        new_weights = []
+        has_weights = len(self.edge_weight) > 0
+        
+        for e_idx in range(self.edge_index.shape[1]):
+            src_asset = edge_src[e_idx].item()
+            dst_asset = edge_dst[e_idx].item()
+            
+            # Skip self-loops in original graph
+            if src_asset == dst_asset:
+                continue
+            
+            # Only include edge if BOTH assets are in the batch
+            if src_asset not in assets_in_batch or dst_asset not in assets_in_batch:
+                continue
+            
+            if time_indices is not None and same_timestep_only:
+                # Create edges only within same time step
+                for t_idx, assets_at_t in time_to_asset_rows.items():
+                    if src_asset in assets_at_t and dst_asset in assets_at_t:
+                        src_rows = assets_at_t[src_asset]
+                        dst_rows = assets_at_t[dst_asset]
+                        for src_row in src_rows:
+                            for dst_row in dst_rows:
+                                new_src.append(src_row)
+                                new_dst.append(dst_row)
+                                if has_weights:
+                                    new_weights.append(self.edge_weight[e_idx].item())
+            else:
+                # Create edges across all time steps
+                src_rows = asset_to_batch_rows[src_asset]
+                dst_rows = asset_to_batch_rows[dst_asset]
+                for src_row in src_rows:
+                    for dst_row in dst_rows:
+                        new_src.append(src_row)
+                        new_dst.append(dst_row)
+                        if has_weights:
+                            new_weights.append(self.edge_weight[e_idx].item())
+        
+        if len(new_src) == 0:
+            return (torch.empty((2, 0), dtype=torch.long, device=device),
+                    None)
+        
+        batch_edge_index = torch.tensor([new_src, new_dst], dtype=torch.long, device=device)
+        batch_edge_weight = torch.tensor(new_weights, dtype=torch.float, device=device) if has_weights else None
+        
+        return batch_edge_index, batch_edge_weight
+    
     @staticmethod
     def build_graph_from_input(x: torch.Tensor, topk: int = 10) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -376,38 +515,66 @@ class GNNTransformer(nn.Module):
         
         return graph_data
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, 
+                asset_indices: Optional[torch.Tensor] = None,
+                time_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass through GNNTransformer.
         
         Args:
             x: Input tensor (N, T) where N is number of nodes/samples, T is time steps.
-               NOTE: Due to the training loop's boolean indexing, N is typically the 
-               number of valid (time_step, asset) pairs in the batch, NOT the original
-               number of assets. The graph is built dynamically from this input.
+               Due to the training loop's boolean indexing, N is typically the 
+               number of valid (time_step, asset) pairs in the batch.
+            
+            asset_indices: Optional (N,) tensor of original asset IDs (0 to N_assets-1)
+                           for each row. If provided, the pre-built graph is remapped
+                           to create proper spatial connections based on original asset
+                           relationships.
+            
+            time_indices: Optional (N,) tensor of time step indices for each row.
+                          If provided along with asset_indices, enables pure spatial
+                          connections (only connecting assets at the same time step).
+                          If not provided, cross-timestep connections may be created.
             
         Returns:
             weights: Portfolio weights (N,)
         """
         N, T = x.shape
         
-        # Determine which graph to use
-        # The stored graph was built for a specific number of assets, but the training
-        # loop flattens (time, asset) pairs using boolean indexing, so input N doesn't
-        # match the original asset count. We need to build a graph from the input.
-        stored_graph_nodes = self._get_num_graph_nodes()
-        use_stored_graph = self.has_valid_graph() and (stored_graph_nodes == N)
+        # Determine which graph to use (priority order):
+        # 1. If asset_indices provided: Remap pre-built graph (RECOMMENDED)
+        # 2. If stored graph matches input size: Use stored graph directly
+        # 3. Otherwise: Build dynamic graph from input (has temporal leakage issues)
         
-        if use_stored_graph:
-            # Stored graph matches input size - use it directly
-            edge_index = self.edge_index
-            edge_weight = self.edge_weight if len(self.edge_weight) > 0 else None
-        else:
-            # Graph doesn't match input size - build dynamically from input data
-            # This handles the case where input is flattened (time, asset) pairs
-            edge_index, edge_weight = self.build_graph_from_input(x, topk=self.gnn_topk)
+        if asset_indices is not None:
+            # OPTION 3: Remap pre-built graph using asset/time indices
+            # This creates edges based on original asset relationships.
+            # If time_indices provided, only connects assets at the same time step
+            # (pure spatial graph). Otherwise, cross-time spatial connections allowed.
+            edge_index, edge_weight = self.remap_graph_for_batch(
+                asset_indices, 
+                time_indices=time_indices,
+                same_timestep_only=(time_indices is not None)
+            )
             edge_index = edge_index.to(x.device)
-            edge_weight = edge_weight.to(x.device)
+            if edge_weight is not None:
+                edge_weight = edge_weight.to(x.device)
+        else:
+            # Fallback: Check if stored graph matches input size
+            stored_graph_nodes = self._get_num_graph_nodes()
+            use_stored_graph = self.has_valid_graph() and (stored_graph_nodes == N)
+            
+            if use_stored_graph:
+                # Stored graph matches input size - use it directly
+                edge_index = self.edge_index
+                edge_weight = self.edge_weight if len(self.edge_weight) > 0 else None
+            else:
+                # Last resort: Build dynamic graph from input correlations
+                # WARNING: This creates temporal connections (same asset at different times)
+                # which is suboptimal but maintains backward compatibility
+                edge_index, edge_weight = self.build_graph_from_input(x, topk=self.gnn_topk)
+                edge_index = edge_index.to(x.device)
+                edge_weight = edge_weight.to(x.device)
         
         has_graph = edge_index.shape[1] > 0
         

@@ -96,7 +96,25 @@ def train(model,
             idxs_batch_i = idxs_selected[batchsize*i:min(batchsize*(i+1),T-lookback),:]  # idxs of valid residuals to trade in batch i
             input_data_batch_i = windows[batchsize*i:min(batchsize*(i+1),T-lookback)][idxs_batch_i]  
             logging.debug(f"epoch {epoch} batch {i} input_data_batch_i.shape {input_data_batch_i.shape}")
-            weights[idxs_batch_i] = model(torch.tensor(input_data_batch_i, device=device))
+            
+            # For GNN models: Extract asset and time indices from the boolean mask
+            # This enables proper spatial graph remapping (pure spatial connections within each timestep)
+            asset_indices = None
+            time_indices = None
+            model_to_check = model.module if parallelize else model
+            if hasattr(model_to_check, 'remap_graph_for_batch'):
+                # Get (time_idx, asset_idx) pairs for all True values in the mask
+                time_asset_pairs = torch.nonzero(idxs_batch_i)  # (num_valid, 2)
+                time_indices = time_asset_pairs[:, 0].to(device)   # Time step within batch
+                asset_indices = time_asset_pairs[:, 1].to(device)  # Original asset ID
+            
+            # Forward pass (with asset_indices and time_indices for GNN models if available)
+            if asset_indices is not None:
+                weights[idxs_batch_i] = model(torch.tensor(input_data_batch_i, device=device), 
+                                               asset_indices=asset_indices,
+                                               time_indices=time_indices)
+            else:
+                weights[idxs_batch_i] = model(torch.tensor(input_data_batch_i, device=device))
             if residual_weights_train is None:
                 abs_sum = torch.sum(torch.abs(weights),axis=1,keepdim=True)
             else:  # residual_weights_train is TxN1xN2 (multiplied by returns on the right gives residuals)
@@ -359,12 +377,27 @@ def get_returns(model,
         #     #print(retsTest, retsTest.shape)
             
         weights = torch.zeros((T-lookback,N),device=device)
+        
+        # For GNN models: Extract asset and time indices from the boolean mask
+        asset_indices = None
+        time_indices = None
+        model_to_check = model.module if parallelize else model
+        if hasattr(model_to_check, 'remap_graph_for_batch'):
+            time_asset_pairs = torch.nonzero(idxs_selected)  # (num_valid, 2)
+            time_indices = time_asset_pairs[:, 0].to(device)   # Time step index
+            asset_indices = time_asset_pairs[:, 1].to(device)  # Original asset ID
+        
         for i in range(len(paths_checkpoints)):  #This ensembles if many checkpoints are given                               
             if load_params:
                 checkpoint = torch.load(paths_checkpoints[i],map_location = device)
                 model.load_state_dict(checkpoint['model_state_dict'])
                 model.to(device)
-            weights[idxs_selected] += model(torch.tensor(windows[idxs_selected],device=device))
+            if asset_indices is not None:
+                weights[idxs_selected] += model(torch.tensor(windows[idxs_selected],device=device), 
+                                                 asset_indices=asset_indices,
+                                                 time_indices=time_indices)
+            else:
+                weights[idxs_selected] += model(torch.tensor(windows[idxs_selected],device=device))
         weights /= len(paths_checkpoints)
         if residual_weights is None:
             abs_sum = torch.sum(torch.abs(weights), axis=1, keepdim=True)
